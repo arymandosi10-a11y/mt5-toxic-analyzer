@@ -5,34 +5,44 @@ import plotly.express as px
 # ---------------------------
 # CONFIG
 # ---------------------------
+SCALPING_SECONDS = 180
+HFT_HOLDING_SECONDS = 60
+HFT_TRADES_PER_MIN = 5
+ARBITRAGE_SECONDS = 10
+ARBITRAGE_WINRATE = 0.80
 
-SCALPING_SECONDS = 180      # <= 180s = scalping
-HFT_HOLDING_SECONDS = 60    # Avg holding <= 60s
-HFT_TRADES_PER_MIN = 5      # >= 5 trades in any minute
-ARBITRAGE_SECONDS = 10      # <= 10s
-ARBITRAGE_WINRATE = 0.80    # 80% winrate on ultra-short trades
-
-st.set_page_config(
-    page_title="MT5 Toxic Trading Analyzer",
-    layout="wide"
-)
-
+st.set_page_config(page_title="MT5 Toxic Trading Analyzer", layout="wide")
 st.title("MT5 Toxic Trading Analyzer")
 
-st.write(
-    """
+st.write("""
 Analyze MT5 trading behavior for:
-
-- Scalping  
-- HFT trading  
+- Scalping
+- HFT trading
 - Arbitrage / Toxic activity
-"""
-)
+""")
 
 # ---------------------------
-# FILE UPLOAD (CSV + XLSX)
+# HELPER: FIND REAL HEADER
 # ---------------------------
+def normalize_col(col):
+    return str(col).strip().lower().replace(" ", "")
 
+def detect_mt5_table(df_raw):
+    required = ["ticket", "opentime", "closetime", "symbol", "volume", "profit"]
+
+    for i in range(len(df_raw)):
+        row = df_raw.iloc[i].astype(str)
+        norm = [normalize_col(c) for c in row]
+        if all(r in norm for r in required):
+            df = df_raw.iloc[i + 1 :].copy()
+            df.columns = row
+            return df
+
+    return None
+
+# ---------------------------
+# FILE UPLOAD
+# ---------------------------
 uploaded_file = st.file_uploader(
     "Upload MT5 Deals / Trading History (CSV or Excel)",
     type=["csv", "xlsx"]
@@ -40,186 +50,96 @@ uploaded_file = st.file_uploader(
 
 df = None
 
-if uploaded_file is not None:
-    filename = uploaded_file.name.lower()
-
+if uploaded_file:
     try:
-        if filename.endswith(".xlsx"):
-            # Excel file (needs openpyxl installed on the server)
-            try:
-                df = pd.read_excel(uploaded_file, engine="openpyxl")
-            except ImportError:
-                st.error(
-                    "Excel file detected (.xlsx) but **openpyxl** is not installed.\n\n"
-                    "Please make sure `openpyxl` is listed in **requirements.txt**, "
-                    "then redeploy the app."
-                )
-                df = None
+        if uploaded_file.name.lower().endswith(".xlsx"):
+            raw = pd.read_excel(uploaded_file, header=None)
         else:
-            # CSV file
-            try:
-                df = pd.read_csv(uploaded_file)
-            except Exception:
-                # Some MT5 exports use ';' as separator
-                uploaded_file.seek(0)
-                df = pd.read_csv(uploaded_file, sep=";")
+            raw = pd.read_csv(uploaded_file, header=None)
+
+        df = detect_mt5_table(raw)
+
+        if df is None:
+            st.error("❌ Could not detect MT5 trade table header.")
+            st.stop()
 
     except Exception as e:
-        st.error(f"Error reading file: {e}")
-        df = None
+        st.error(f"File read error: {e}")
+        st.stop()
 
+# ---------------------------
+# PROCESS DATA
+# ---------------------------
 if df is not None:
-    st.subheader("Uploaded Data Preview")
+    st.subheader("Detected Trade Table Preview")
     st.dataframe(df.head(), use_container_width=True)
 
-    # ---------------------------
-    # REQUIRED COLUMNS CHECK
-    # ---------------------------
+    # Normalize column names
+    df.columns = [normalize_col(c) for c in df.columns]
 
-    required_cols = [
-        "Ticket",
-        "Open Time",
-        "Close Time",
-        "Symbol",
-        "Volume",
-        "Profit",
-    ]
+    col_map = {
+        "ticket": "Ticket",
+        "opentime": "Open Time",
+        "closetime": "Close Time",
+        "symbol": "Symbol",
+        "volume": "Volume",
+        "profit": "Profit",
+    }
+
+    df = df.rename(columns=col_map)
+
+    required_cols = list(col_map.values())
     missing = [c for c in required_cols if c not in df.columns]
-
     if missing:
         st.error(f"Missing required columns: {missing}")
         st.stop()
-
-    # ---------------------------
-    # PROCESS DATA
-    # ---------------------------
 
     df["Open Time"] = pd.to_datetime(df["Open Time"], errors="coerce")
     df["Close Time"] = pd.to_datetime(df["Close Time"], errors="coerce")
     df = df.dropna(subset=["Open Time", "Close Time"])
 
-    df["Holding Seconds"] = (
-        df["Close Time"] - df["Open Time"]
-    ).dt.total_seconds()
+    df["Profit"] = pd.to_numeric(df["Profit"], errors="coerce").fillna(0)
+    df["Volume"] = pd.to_numeric(df["Volume"], errors="coerce").fillna(0)
+
+    df["Holding Seconds"] = (df["Close Time"] - df["Open Time"]).dt.total_seconds()
 
     df["Scalping"] = df["Holding Seconds"] <= SCALPING_SECONDS
-    df["HFT_Band"] = df["Holding Seconds"] <= HFT_HOLDING_SECONDS
-    df["Arbitrage_Short"] = df["Holding Seconds"] <= ARBITRAGE_SECONDS
-
-    # Trades per minute (for HFT detection)
-    df["Open Minute"] = df["Open Time"].dt.floor("min")
-    trades_per_min = df.groupby("Open Minute")["Ticket"].count()
-    max_trades_per_min = trades_per_min.max() if not trades_per_min.empty else 0
-    avg_holding = df["Holding Seconds"].mean() if len(df) > 0 else 0
-
-    hft_suspect = (
-        avg_holding <= HFT_HOLDING_SECONDS
-        and max_trades_per_min >= HFT_TRADES_PER_MIN
-    )
-
-    # Arbitrage suspicion: ultra short trades
-    arb_df = df[df["Arbitrage_Short"]]
-    arb_winrate = None
-    arb_suspect = False
-    if len(arb_df) > 0:
-        arb_winrate = (arb_df["Profit"] > 0).mean()
-        arb_suspect = arb_winrate >= ARBITRAGE_WINRATE
+    df["HFT"] = df["Holding Seconds"] <= HFT_HOLDING_SECONDS
+    df["Arbitrage"] = df["Holding Seconds"] <= ARBITRAGE_SECONDS
 
     # ---------------------------
-    # SUMMARY
+    # METRICS
     # ---------------------------
-
     total_trades = len(df)
     total_profit = df["Profit"].sum()
-    scalp_trades = df["Scalping"].sum()
-    scalp_profit = df.loc[df["Scalping"], "Profit"].sum()
-
-    # Simple toxic score (you can tune later)
-    toxic_score = (
-        (scalp_trades / total_trades if total_trades else 0) * 40
-        + (30 if hft_suspect else 0)
-        + ((arb_winrate or 0) * 30)
-    )
 
     st.divider()
-    st.subheader("Summary")
-
     c1, c2, c3 = st.columns(3)
     c1.metric("Total Trades", total_trades)
-    c1.metric("Total P&L", round(total_profit, 2))
-
-    c2.metric("Scalping Trades", scalp_trades)
-    c2.metric("Scalping P&L", round(scalp_profit, 2))
-
-    c3.metric("HFT Suspect", "YES" if hft_suspect else "NO")
-    c3.metric(
-        "Arbitrage Winrate",
-        f"{arb_winrate:.1%}" if arb_winrate is not None else "N/A",
-    )
-
-    risk_level = (
-        "HIGH RISK"
-        if toxic_score >= 70
-        else "MEDIUM RISK"
-        if toxic_score >= 40
-        else "LOW RISK"
-    )
-
-    st.subheader(f"Toxic Score: {round(toxic_score, 1)} / 100 → {risk_level}")
+    c2.metric("Total P&L", round(total_profit, 2))
+    c3.metric("Scalping Trades", df["Scalping"].sum())
 
     # ---------------------------
     # EQUITY CURVE
     # ---------------------------
-
-    st.divider()
     st.subheader("Equity Curve")
-
     df_sorted = df.sort_values("Close Time")
     df_sorted["Cumulative P&L"] = df_sorted["Profit"].cumsum()
 
-    fig_eq = px.line(
+    fig = px.line(
         df_sorted,
         x="Close Time",
         y="Cumulative P&L",
-        title="Cumulative P&L Over Time",
+        title="Cumulative Profit/Loss"
     )
-    st.plotly_chart(fig_eq, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True)
 
     # ---------------------------
-    # HOLDING TIME DISTRIBUTION
+    # TABLE
     # ---------------------------
-
-    st.subheader("Holding Time Distribution (Seconds)")
-
-    fig_hold = px.histogram(
-        df,
-        x="Holding Seconds",
-        nbins=50,
-        title="Distribution of Holding Time",
-    )
-    st.plotly_chart(fig_hold, use_container_width=True)
-
-    # ---------------------------
-    # TRADES TABLE WITH FILTERS
-    # ---------------------------
-
-    st.divider()
-    st.subheader("Trades Analysis Table")
-
-    only_scalp = st.checkbox("Show only Scalping trades (<= 180 sec)")
-    only_hft = st.checkbox("Show only HFT time-band trades (<= 60 sec)")
-    only_arb = st.checkbox("Show only Arbitrage-short trades (<= 10 sec)")
-
-    view_df = df.copy()
-    if only_scalp:
-        view_df = view_df[view_df["Scalping"]]
-    if only_hft:
-        view_df = view_df[view_df["HFT_Band"]]
-    if only_arb:
-        view_df = view_df[view_df["Arbitrage_Short"]]
-
+    st.subheader("Trade Details")
     st.dataframe(
-        view_df[
+        df[
             [
                 "Ticket",
                 "Symbol",
@@ -229,19 +149,16 @@ if df is not None:
                 "Holding Seconds",
                 "Profit",
                 "Scalping",
-                "HFT_Band",
-                "Arbitrage_Short",
+                "HFT",
+                "Arbitrage",
             ]
         ],
-        use_container_width=True,
+        use_container_width=True
     )
 
-    csv_out = view_df.to_csv(index=False).encode("utf-8")
     st.download_button(
-        "Download Filtered Trades CSV",
-        csv_out,
-        "filtered_trades.csv",
+        "Download Analyzed Trades (CSV)",
+        df.to_csv(index=False),
+        "mt5_analyzed_trades.csv",
+        mime="text/csv"
     )
-
-else:
-    st.info("Please upload an MT5 deals / history file to start the analysis.")
