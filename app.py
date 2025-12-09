@@ -126,4 +126,104 @@ if df is not None:
     toxic_score = (
         (scalp_trades / total_trades if total_trades else 0) * 40
         + (30 if hft_suspect else 0)
-        + ((arb_winrate or 0)_
+        + ((arb_winrate or 0) * 30)
+    )
+
+    st.divider()
+    st.subheader("Summary")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Trades", total_trades)
+    c1.metric("Total P&L", round(total_profit, 2))
+
+    c2.metric("Scalping Trades", scalp_trades)
+    c2.metric("Scalping P&L", round(scalp_profit, 2))
+
+    c3.metric("HFT Suspect", "YES" if hft_suspect else "NO")
+    c3.metric(
+        "Arbitrage Winrate",
+        f"{arb_winrate:.1%}" if arb_winrate is not None else "N/A"
+    )
+
+    risk_level = (
+        "HIGH RISK" if toxic_score >= 70
+        else "MEDIUM RISK" if toxic_score >= 40
+        else "LOW RISK"
+    )
+
+    st.subheader(f"Toxic Score: {round(toxic_score, 1)} / 100 → {risk_level}")
+
+    # ---------------------------
+    # EQUITY CURVE
+    # ---------------------------
+    st.divider()
+    st.subheader("Equity Curve")
+
+    df_sorted = df.sort_values("Close Time")
+    df_sorted["Cumulative P&L"] = df_sorted["Profit"].cumsum()
+
+    fig_eq = px.line(
+        df_sorted,
+        x="Close Time",
+        y="Cumulative P&L",
+        title="Cumulative P&L Over Time",
+    )
+    st.plotly_chart(fig_eq, use_container_width=True)
+
+    # ---------------------------
+    # HOLDING TIME DISTRIBUTION
+    # ---------------------------
+    st.subheader("Holding Time Distribution (Seconds)")
+    fig_hold = px.histogram(
+        df,
+        x="Holding Seconds",
+        nbins=50,
+        title="Distribution of Holding Time",
+    )
+    st.plotly_chart(fig_hold, use_container_width=True)
+
+    # ---------------------------
+    # TRADES TABLE WITH FILTERS
+    # ---------------------------
+    st.divider()
+    st.subheader("Trades Analysis Table")
+
+    only_scalp = st.checkbox("Show only Scalping trades (<= 180 sec)")
+    only_hft = st.checkbox("Show only HFT time-band trades (<= 60 sec)")
+    only_arb = st.checkbox("Show only Arbitrage-short trades (<= 10 sec)")
+
+    view_df = df.copy()
+
+    if only_scalp:
+        view_df = view_df[view_df["Scalping"]]
+    if only_hft:
+        view_df = view_df[view_df["HFT_Band"]]
+    if only_arb:
+        view_df = view_df[view_df["Arbitrage_Short"]]
+
+    st.dataframe(
+        view_df[
+            [
+                "Ticket",
+                "Symbol",
+                "Volume",
+                "Open Time",
+                "Close Time",
+                "Holding Seconds",
+                "Profit",
+                "Scalping",
+                "HFT_Band",
+                "Arbitrage_Short",
+            ]
+        ],
+        use_container_width=True,
+    )
+
+    csv_out = view_df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download Filtered Trades CSV",
+        csv_out,
+        "filtered_trades.csv",
+    )
+else:
+    st.info("Please upload an MT5 deals / history file to start the analysis.")
